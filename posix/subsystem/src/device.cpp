@@ -22,7 +22,7 @@ UnixDeviceRegistry blockRegistry;
 // UnixDevice
 // --------------------------------------------------------
 
-FutureMaybe<std::shared_ptr<FsLink>> UnixDevice::mount() {
+FutureMaybe<std::shared_ptr<FsLink>> UnixDevice::mount(std::string) {
 	// TODO: Return an error.
 	throw std::logic_error("Device cannot be mounted!");
 }
@@ -352,23 +352,23 @@ async::result<void> serveServerLane(helix::UniqueDescriptor lane) {
 	}
 }
 
-FutureMaybe<std::shared_ptr<FsLink>> mountExternalDevice(helix::BorrowedLane lane, std::shared_ptr<UnixDevice> device) {
-	managarm::fs::CntRequest req;
-	req.set_req_type(managarm::fs::CntReqType::DEV_MOUNT);
+FutureMaybe<std::shared_ptr<FsLink>> mountExternalDevice(helix::BorrowedLane lane, std::shared_ptr<UnixDevice> device, std::string fs_type) {
+	managarm::fs::MountRequest req;
+	req.set_fs_type(fs_type);
 
-	auto ser = req.SerializeAsString();
-	auto [offer, send_req, recv_resp, pull_node] = co_await helix_ng::exchangeMsgs(lane,
+	auto [offer, send_head, send_tail, recv_resp, pull_node] = co_await helix_ng::exchangeMsgs(lane,
 		helix_ng::offer(
-			helix_ng::sendBuffer(ser.data(), ser.size()),
+			helix_ng::sendBragiHeadTail(req, frg::stl_allocator{}),
 			helix_ng::recvInline(),
 			helix_ng::pullDescriptor())
 	);
 	HEL_CHECK(offer.error());
-	HEL_CHECK(send_req.error());
+	HEL_CHECK(send_head.error());
+	HEL_CHECK(send_tail.error());
 	HEL_CHECK(recv_resp.error());
 	HEL_CHECK(pull_node.error());
 
-	managarm::fs::SvrResponse resp;
+	managarm::fs::MountResponse resp;
 	resp.ParseFromArray(recv_resp.data(), recv_resp.length());
 	recv_resp.reset();
 	assert(resp.error() == managarm::fs::Errors::SUCCESS);

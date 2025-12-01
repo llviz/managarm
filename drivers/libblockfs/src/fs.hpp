@@ -27,7 +27,7 @@ struct BaseInode {
 	BaseInode &operator=(BaseInode &&) = delete;
 
 	BaseFileSystem &fs;
-	const uint32_t number;
+	const uint64_t number;
 
 	async::oneshot_event readyEvent;
 
