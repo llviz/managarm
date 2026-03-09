@@ -12,6 +12,12 @@ namespace thor {
 
 namespace {
 	constexpr bool logCleanup = false;
+	constexpr bool logRss = false;
+
+	// Used in working set limit computation.
+	// TODO: Do not make this global and add a hierarchical API that allows userspace
+	//       to control weights or similar for working set size computation.
+	constinit std::atomic<size_t> numVirtualSpaces{0};
 
 	uint32_t compilePageFlags(MappingFlags mappingFlags) {
 		uint32_t pageFlags = 0;
@@ -152,7 +158,7 @@ coroutine<void> Mapping::runEvictionLoop() {
 				// Unmap the memory range.
 				auto unmapOutcome = owner->_ops->unmapPages(address + shootOffset, shootSize);
 				assert(unmapOutcome);
-				owner->rss_.fetch_add(unmapOutcome.value().rssIncrease - unmapOutcome.value().rssDecrease, std::memory_order_relaxed);
+				owner->notifyRss_(unmapOutcome.value());
 				anyRevoked = unmapOutcome.value().anyRevoked;
 
 				if(anyRevoked)
@@ -201,7 +207,33 @@ CowChain::~CowChain() {
 // --------------------------------------------------------
 
 VirtualSpace::VirtualSpace(VirtualOperations *ops)
-: _ops{ops} { }
+: _ops{ops} {
+	numVirtualSpaces.fetch_add(1, std::memory_order_relaxed);
+}
+
+ptrdiff_t VirtualSpace::workingSetGoal_() {
+	auto n = numVirtualSpaces.load(std::memory_order_relaxed);
+	assert(n);
+	return physicalAllocator->numTotalPages() * kPageSize / n;
+}
+
+void VirtualSpace::notifyRss_(const PagesAffected &affected) {
+	rss_.fetch_add(affected.rssIncrease - affected.rssDecrease, std::memory_order_relaxed);
+	agingTurnover_.fetch_add(affected.rssIncrease, std::memory_order_relaxed);
+	if(shouldContinueAging_())
+		agingEvent_.raise();
+}
+
+bool VirtualSpace::shouldContinueAging_() {
+	// Considerations:
+	// * We do not want to run aging if too few pages are mapped; otherwise, we would
+	//   wrap around the address space too quickly and invest too much work for little to no gain.
+	// * We want to run aging frequently enough to ensure the page ages
+	//   are meaningful and not just all zero or one.
+	auto goal = workingSetGoal_();
+	return rss_.load(std::memory_order_relaxed) >= goal / 2
+		&& agingTurnover_.load(std::memory_order_relaxed) >= goal / 5;
+}
 
 void VirtualSpace::setupInitialHole(VirtualAddr address, size_t size) {
 	auto hole = frg::construct<Hole>(*kernelAlloc, address, size);
@@ -209,6 +241,8 @@ void VirtualSpace::setupInitialHole(VirtualAddr address, size_t size) {
 }
 
 VirtualSpace::~VirtualSpace() {
+	numVirtualSpaces.fetch_sub(1, std::memory_order_relaxed);
+
 	if(logCleanup)
 		debugLogger() << "thor: VirtualSpace is destructed" << frg::endlog;
 
@@ -243,7 +277,7 @@ void VirtualSpace::retire() {
 
 			auto unmapOutcome = self->_ops->unmapPages(mapping->address, mapping->length);
 			assert(unmapOutcome);
-			self->rss_.fetch_add(unmapOutcome.value().rssIncrease - unmapOutcome.value().rssDecrease, std::memory_order_relaxed);
+			self->notifyRss_(unmapOutcome.value());
 
 			mapping = MappingTree::successor(mapping);
 		}
@@ -270,12 +304,29 @@ void VirtualSpace::retire() {
 coroutine<void> VirtualSpace::runAgingLoop() {
 	auto self = selfPtr.lock();
 
+	// This function scans over the entire address space in a circular fashion.
+	// It does not do one pass at a time, instead we stop when shouldContinueAging_() becomes false.
+	// nextAddress is the virtual address that we will continue at.
+	VirtualAddr nextAddress{0};
 	while(true) {
-		if(!co_await generalTimerEngine()->sleepFor(1'000'000'000ULL, cancelAging_))
+		auto waitOutcome = co_await agingEvent_.async_wait_if([&] {
+			return !shouldContinueAging_();
+		}, cancelAging_);
+
+		if (!waitOutcome)
 			break;
 
-		VirtualAddr nextAddress = 0;
-		while(true) {
+		while(shouldContinueAging_()) {
+			if (logRss && !nextAddress) {
+				// Only log on wrap-around to avoid log spam.
+				infoLogger() << frg::fmt(
+					"thor: {} RSS: 0x{:x}, goal: 0x{:x}",
+					this,
+					rss_.load(std::memory_order_relaxed),
+					workingSetGoal_()
+				) << frg::endlog;
+			}
+
 			smarter::shared_ptr<Mapping> mapping;
 			{
 				auto irqLock = frg::guard(&irqMutex());
@@ -296,9 +347,12 @@ coroutine<void> VirtualSpace::runAgingLoop() {
 				if(candidate)
 					mapping = candidate->selfPtr.lock();
 			}
-			if(!mapping)
-				break;
 
+			// Wrap-around when we reach the end of the address space.
+			if(!mapping) {
+				nextAddress = 0;
+				continue;
+			}
 			nextAddress = mapping->address + mapping->length;
 
 			if(mapping->state.load(std::memory_order_relaxed) != MappingState::active)
@@ -308,9 +362,11 @@ coroutine<void> VirtualSpace::runAgingLoop() {
 			{
 				LocalRcuEngine::Guard revokeGuard{mapping->revokeRcu};
 
-				auto ageOutcome = _ops->agePages(mapping->address, mapping->length);
+				bool vacate = rss_.load(std::memory_order_relaxed) > workingSetGoal_();
+				auto ageOutcome = _ops->agePages(mapping->address, mapping->length, vacate);
 				assert(ageOutcome);
-				rss_.fetch_add(ageOutcome.value().rssIncrease - ageOutcome.value().rssDecrease, std::memory_order_relaxed);
+				agingTurnover_.fetch_sub(ageOutcome.value().scanned, std::memory_order_relaxed);
+				notifyRss_(ageOutcome.value());
 				anyRevoked = ageOutcome.value().anyRevoked;
 
 				if(anyRevoked)
@@ -449,7 +505,7 @@ VirtualSpace::map(smarter::borrowed_ptr<MemorySlice> slice,
 				auto mapOutcome = _ops->mapPresentPages(mapping->address, mapping->view.get(),
 						mapping->viewOffset, mapping->length, pageFlags, caching);
 				assert(mapOutcome);
-				rss_.fetch_add(mapOutcome.value().rssIncrease - mapOutcome.value().rssDecrease, std::memory_order_relaxed);
+				notifyRss_(mapOutcome.value());
 				if(mapOutcome.value().anyRevoked)
 					co_await _ops->shootdown(mapping->address, mapping->length);
 			}
@@ -670,7 +726,7 @@ VirtualSpace::handleFault(VirtualAddr address, uint32_t faultFlags) {
 						continue;
 					}
 				} else {
-					rss_.fetch_add(remapOutcome.value().rssIncrease - remapOutcome.value().rssDecrease, std::memory_order_relaxed);
+					notifyRss_(remapOutcome.value());
 					if(remapOutcome.value().anyRevoked)
 						co_await _ops->shootdown(address & ~(kPageSize - 1), kPageSize);
 				}
@@ -1009,7 +1065,7 @@ coroutine<void> VirtualSpace::_unmapMappings(VirtualAddr address, size_t length,
 				// Mark pages as dirty and unmap without holding a lock.
 				auto unmapOutcome = _ops->unmapPages(mapping->address, mapping->length);
 				assert(unmapOutcome);
-				rss_.fetch_add(unmapOutcome.value().rssIncrease - unmapOutcome.value().rssDecrease, std::memory_order_relaxed);
+				notifyRss_(unmapOutcome.value());
 				anyRevoked = unmapOutcome.value().anyRevoked;
 
 				if(anyRevoked)
