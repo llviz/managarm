@@ -7,6 +7,7 @@
 #include <async/oneshot-event.hpp>
 #include <async/post-ack.hpp>
 #include <async/recurring-event.hpp>
+#include <frg/list.hpp>
 #include <frg/rcu_radixtree.hpp>
 #include <frg/shared_ptr.hpp>
 #include <frg/vector.hpp>
@@ -53,6 +54,7 @@ struct CachePage {
 	frg::default_list_hook<CachePage> listHook;
 
 	uint32_t flags = 0;
+	uint8_t generation = 0;
 	std::atomic<unsigned int> useCount = 0;
 };
 
@@ -60,12 +62,33 @@ struct CachePage {
 struct CacheBundle {
 	friend struct MemoryReclaimer;
 
+	// Number of generations for the LRU mechanism.
+	static constexpr unsigned int numGenerations = 8;
+
 	virtual void incrementUses(CachePage *page) = 0;
 	virtual void decrementUses(CachePage *page) = 0;
 
 	virtual void markDirty(CachePage *page) = 0;
 
 private:
+	frg::ticket_spinlock reclaimMutex_;
+
+	// One list of pages per generation.
+	// Protected by reclaimMutex_.
+	frg::intrusive_list<
+		CachePage,
+		frg::locate_member<
+			CachePage,
+			frg::default_list_hook<CachePage>,
+			&CachePage::listHook
+		>
+	> genLists_[numGenerations];
+
+	// Points to the newest generation.
+	// This is cyclically incremented on rotation.
+	unsigned int newestGen_ = 0;
+
+	// Protected by reclaimMutex_.
 	frg::intrusive_list<
 		CachePage,
 		frg::locate_member<
@@ -76,6 +99,9 @@ private:
 	> _reclaimList;
 
 	async::recurring_event _reclaimEvent;
+
+	// List hook used by MemoryReclaimer.
+	frg::intrusive_rcu_list_hook<CacheBundle> reclaimerHook_;
 };
 
 inline void markDirty(PfnDescriptor descriptor) {

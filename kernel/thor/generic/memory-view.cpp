@@ -13,6 +13,7 @@ namespace thor {
 
 namespace {
 	constexpr bool logUsage = false;
+	constexpr bool logReclaim = false;
 	constexpr bool logUncaching = false;
 
 	// The following flags are debugging options to debug the correctness of various components.
@@ -25,70 +26,98 @@ namespace {
 // --------------------------------------------------------
 
 struct MemoryReclaimer {
-	void addPage(CachePage *page) {
+	void registerBundle(CacheBundle *bundle) {
 		auto irqLock = frg::guard(&irqMutex());
-		auto lock = frg::guard(&_mutex);
+		auto lock = frg::guard(&mutex_);
 
-		assert(!(page->flags & CachePage::reclaimRegistered));
+		bundleList_.push_back(bundle);
+	}
 
-		_lruList.push_back(page);
-		page->flags |= CachePage::reclaimRegistered;
-		_cachedSize += kPageSize;
+	void addPage(CachePage *page) {
+		auto *bundle = page->bundle;
+		{
+			auto irqLock = frg::guard(&irqMutex());
+			auto lock = frg::guard(&bundle->reclaimMutex_);
+
+			assert(!(page->flags & CachePage::reclaimRegistered));
+
+			page->generation = bundle->newestGen_;
+			bundle->genLists_[bundle->newestGen_].push_back(page);
+			page->flags |= CachePage::reclaimRegistered;
+		}
+
+		rotationTurnaround_.fetch_add(1, std::memory_order_relaxed);
+		if (shouldRotate_())
+			rotationEvent_.raise();
 	}
 
 	void removePage(CachePage *page) {
+		auto *bundle = page->bundle;
 		auto irqLock = frg::guard(&irqMutex());
-		auto lock = frg::guard(&_mutex);
+		auto lock = frg::guard(&bundle->reclaimMutex_);
 
 		assert(page->flags & CachePage::reclaimRegistered);
 
 		if(page->flags & CachePage::reclaimPosted) {
 			if(!(page->flags & CachePage::reclaimInflight)) {
-				auto it = page->bundle->_reclaimList.iterator_to(page);
-				page->bundle->_reclaimList.erase(it);
+				auto it = bundle->_reclaimList.iterator_to(page);
+				bundle->_reclaimList.erase(it);
 			}
 
 			page->flags &= ~(CachePage::reclaimPosted | CachePage::reclaimInflight);
 		}else{
-			auto it = _lruList.iterator_to(page);
-			_lruList.erase(it);
-			_cachedSize -= kPageSize;
+			auto it = bundle->genLists_[page->generation].iterator_to(page);
+			bundle->genLists_[page->generation].erase(it);
 		}
 		page->flags &= ~CachePage::reclaimRegistered;
 	}
 
 	void bumpPage(CachePage *page) {
-		auto irqLock = frg::guard(&irqMutex());
-		auto lock = frg::guard(&_mutex);
+		auto *bundle = page->bundle;
+		{
+			auto irqLock = frg::guard(&irqMutex());
+			auto lock = frg::guard(&bundle->reclaimMutex_);
 
-		assert(page->flags & CachePage::reclaimRegistered);
+			assert(page->flags & CachePage::reclaimRegistered);
 
-		if(page->flags & CachePage::reclaimPosted) {
-			if(!(page->flags & CachePage::reclaimInflight)) {
-				auto it = page->bundle->_reclaimList.iterator_to(page);
-				page->bundle->_reclaimList.erase(it);
+			if(page->flags & CachePage::reclaimPosted) {
+				if(!(page->flags & CachePage::reclaimInflight)) {
+					auto it = bundle->_reclaimList.iterator_to(page);
+					bundle->_reclaimList.erase(it);
+				}
+
+				page->flags &= ~(CachePage::reclaimPosted | CachePage::reclaimInflight);
+				page->generation = bundle->newestGen_;
+				bundle->genLists_[bundle->newestGen_].push_back(page);
+			}else if(page->generation != bundle->newestGen_) {
+				auto it = bundle->genLists_[page->generation].iterator_to(page);
+				bundle->genLists_[page->generation].erase(it);
+				page->generation = bundle->newestGen_;
+				bundle->genLists_[bundle->newestGen_].push_back(page);
 			}
-
-			page->flags &= ~(CachePage::reclaimPosted | CachePage::reclaimInflight);
-			_cachedSize += kPageSize;
-		}else{
-			auto it = _lruList.iterator_to(page);
-			_lruList.erase(it);
 		}
 
-		_lruList.push_back(page);
+		rotationTurnaround_.fetch_add(1, std::memory_order_relaxed);
+		if (shouldRotate_())
+			rotationEvent_.raise();
 	}
 
 	auto awaitReclaim(CacheBundle *bundle, async::cancellation_token ct = {}) {
 		return async::transform(
-			bundle->_reclaimEvent.async_wait(ct),
+			bundle->_reclaimEvent.async_wait_if(
+				[bundle] {
+					auto irqLock = frg::guard(&irqMutex());
+					auto lock = frg::guard(&bundle->reclaimMutex_);
+					return bundle->_reclaimList.empty();
+				},
+				ct),
 			[] (auto) { }
 		);
 	}
 
 	CachePage *reclaimPage(CacheBundle *bundle) {
 		auto irqLock = frg::guard(&irqMutex());
-		auto lock = frg::guard(&_mutex);
+		auto lock = frg::guard(&bundle->reclaimMutex_);
 
 		if(bundle->_reclaimList.empty())
 			return nullptr;
@@ -105,82 +134,146 @@ struct MemoryReclaimer {
 	}
 
 	void runReclaimFiber() {
-		auto checkReclaim = [this] () -> bool {
-			if(disableUncaching)
-				return false;
-
-			auto irqLock = frg::guard(&irqMutex());
-			auto lock = frg::guard(&_mutex);
-
-			if(_lruList.empty())
-				return false;
-
-			if(!tortureUncaching) {
-				auto pagesWatermark = physicalAllocator->numTotalPages() * 3 / 4;
-				auto usedPages = physicalAllocator->numUsedPages();
-				if(usedPages < pagesWatermark) {
-					return false;
-				}else{
-					if(logUncaching)
-						infoLogger() << "thor: Uncaching page. " << usedPages
-								<< " pages are in use (watermark: " << pagesWatermark << ")"
-								<< frg::endlog;
-				}
-			}
-
-			auto page = _lruList.pop_front();
-
-			assert(page->flags & CachePage::reclaimRegistered);
-			assert(!(page->flags & CachePage::reclaimPosted));
-			assert(!(page->flags & CachePage::reclaimInflight));
-
-			page->flags |= CachePage::reclaimPosted;
-			_cachedSize -= kPageSize;
-
-			page->bundle->_reclaimList.push_back(page);
-			page->bundle->_reclaimEvent.raise();
-
-			return true;
-		};
-
-		KernelFiber::run([=, this] {
+		KernelFiber::run([this] {
+			if (disableUncaching)
+				return;
 			while(true) {
-				if(logUncaching) {
-					auto irqLock = frg::guard(&irqMutex());
-					auto lock = frg::guard(&_mutex);
-					auto totalPages = physicalAllocator->numTotalPages();
-					auto usedPages = physicalAllocator->numUsedPages();
+				auto totalPages = physicalAllocator->numTotalPages();
+				auto usedPages = physicalAllocator->numUsedPages();
+
+				if(logReclaim) {
 					infoLogger() << "thor: " << (usedPages * kPageSize / 1024)
 							<< " KiB / " << (totalPages * kPageSize / 1024)
-							<< " in use" << frg::endlog;
-					infoLogger() << "thor: " << (_cachedSize / 1024)
-							<< " KiB of cached pages" << frg::endlog;
+							<< " KiB in use" << frg::endlog;
 				}
 
-				while(checkReclaim())
-					;
-				if(tortureUncaching) {
-					KernelFiber::asyncBlockCurrent(generalTimerEngine()->sleepFor(10'000'000));
-				}else{
-					KernelFiber::asyncBlockCurrent(generalTimerEngine()->sleepFor(1'000'000'000));
+				// On memory pressure: rotate generations until pressure drops.
+				if (checkPressure_()) {
+					for(unsigned int i = 1; i <= CacheBundle::numGenerations; i++) {
+						if(!checkPressure_())
+							break;
+
+						auto result = rotateGenerations_();
+						if(logReclaim) {
+							infoLogger() << frg::fmt(
+								"thor: Reclamation under pressure (iteration {}) reclaims 0x{:x} bytes",
+								i,
+								result.sizeReclaimed
+							) << frg::endlog;
+						}
+					}
 				}
+
+				// Otherwise: rotate generations when number of page bumps crosses threshold.
+				if(shouldRotate_()) {
+					auto result = rotateGenerations_();
+					if(logReclaim) {
+						infoLogger() << frg::fmt(
+							"thor: Generation rotation reclaims 0x{:x} bytes",
+							result.sizeReclaimed
+						) << frg::endlog;
+					}
+				}
+
+				auto sleepNs = tortureUncaching ? 10'000'000 : 1'000'000'000;
+				KernelFiber::asyncBlockCurrent(
+					async::race_and_cancel(
+						[&] (async::cancellation_token ct) {
+							return async::transform(
+								rotationEvent_.async_wait_if([&] -> bool {
+									return !shouldRotate_();
+								}, ct),
+								[] (auto) {}
+							);
+						},
+						[&] (async::cancellation_token ct) {
+							// TODO: It would be nicer to also handle the pressure case by an event
+							//       but that requires integration with the physical allocator.
+							return async::transform(
+								generalTimerEngine()->sleepFor(sleepNs, ct),
+								[] (auto) {}
+							);
+						}
+					)
+				);
 			}
 		});
 	}
 
 private:
-	frg::ticket_spinlock _mutex;
+	struct RotateResult {
+		size_t sizeReclaimed{0};
+	};
 
-	frg::intrusive_list<
-		CachePage,
+	RotateResult rotateGenerations_() {
+		rotationTurnaround_.store(0, std::memory_order_relaxed);
+
+		size_t sizeReclaimed = 0;
+		for(auto it = bundleList_.begin(); it != bundleList_.end(); ++it) {
+			auto *bundle = *it;
+
+			bool anyReclaimed = false;
+			{
+				auto irqLock = frg::guard(&irqMutex());
+				auto lock = frg::guard(&bundle->reclaimMutex_);
+
+				// The slot after newest is the oldest.
+				// This becomes the newest generation after rotation.
+				auto g = (bundle->newestGen_ + 1) % CacheBundle::numGenerations;
+
+				// Drain the oldest generation into _reclaimList.
+				auto &genList = bundle->genLists_[g];
+				while(!genList.empty()) {
+					auto page = genList.pop_front();
+					assert(page->flags & CachePage::reclaimRegistered);
+					assert(!(page->flags & CachePage::reclaimPosted));
+					page->flags |= CachePage::reclaimPosted;
+					bundle->_reclaimList.push_back(page);
+					anyReclaimed = true;
+					sizeReclaimed += kPageSize;
+				}
+				bundle->newestGen_ = g;
+			}
+
+			if(anyReclaimed)
+				bundle->_reclaimEvent.raise();
+		}
+
+		return {
+			.sizeReclaimed = sizeReclaimed
+		};
+	}
+
+	bool shouldRotate_() {
+		// TODO: We assume that half of total memory is available for CachePages.
+		//       Instead, we should track how many non-swappable pages are allocated
+		//       and subtract that from the total page count.
+		auto totalCachePages = physicalAllocator->numTotalPages() / 2;
+		auto threshold = totalCachePages / CacheBundle::numGenerations;
+		return rotationTurnaround_.load(std::memory_order_relaxed) >= threshold;
+	}
+
+	bool checkPressure_() {
+		auto watermark = physicalAllocator->numTotalPages() * 3 / 4;
+		return tortureUncaching || physicalAllocator->numUsedPages() >= watermark;
+	}
+
+	frg::ticket_spinlock mutex_;
+
+	// Protected against modification by mutex_.
+	frg::intrusive_rcu_list<
+		CacheBundle,
 		frg::locate_member<
-			CachePage,
-			frg::default_list_hook<CachePage>,
-			&CachePage::listHook
+			CacheBundle,
+			frg::intrusive_rcu_list_hook<CacheBundle>,
+			&CacheBundle::reclaimerHook_
 		>
-	> _lruList;
+	> bundleList_;
 
-	size_t _cachedSize = 0;
+	// Number of pages bumped since the last generation rotation.
+	std::atomic<size_t> rotationTurnaround_{0};
+
+	async::recurring_event rotationEvent_;
 };
 
 static frg::manual_box<MemoryReclaimer> globalReclaimer;
@@ -755,6 +848,8 @@ size_t AllocatedMemory::getLength() {
 ManagedSpace::ManagedSpace(size_t length, bool readahead)
 : pages{*kernelAlloc}, numPages{length >> kPageShift}, readahead{readahead} {
 	assert(!(length & (kPageSize - 1)));
+
+	globalReclaimer->registerBundle(this);
 
 	[] (ManagedSpace *self, enable_detached_coroutine) -> void {
 		while(true) {
