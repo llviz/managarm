@@ -361,11 +361,6 @@ coroutine<void> executeModule(frg::string_view name, MfsRegular *module,
 	auto thread = Thread::create(std::move(universe), std::move(space), params);
 	thread->self = remove_tag_cast(thread);
 	thread->flags |= Thread::kFlagServer;
-	
-	// listen to POSIX calls from the thread.
-	runService(frg::string<KernelAlloc>{*kernelAlloc, name.data(), name.size()},
-			control_lane,
-			thread);
 
 	// see helCreateThread for the reasoning here
 	thread.ctr()->increment();
@@ -375,6 +370,12 @@ coroutine<void> executeModule(frg::string_view name, MfsRegular *module,
 	Scheduler::associate(thread.get(), scheduler);
 	Scheduler::resume(thread.get());
 	Thread::resumeOther(remove_tag_cast(thread));
+
+	// Listen to POSIX calls from the thread.
+	// Call this after resumeOther() to ensure that we do not see the initial interrupt.
+	runService(frg::string<KernelAlloc>{*kernelAlloc, name.data(), name.size()},
+			control_lane,
+			thread);
 }
 
 void initializeMbusStream() {

@@ -564,13 +564,15 @@ void Thread::raiseCondition_(Condition c) {
 Thread::Thread(smarter::shared_ptr<Universe> universe,
 		smarter::shared_ptr<AddressSpace, BindableHandle> address_space, AbiParameters abi)
 : flags{0}, _mainWorkQueue{this, ipl::passiveWork}, _pagingWorkQueue{this, ipl::exceptionalWork},
-		_runState{kRunDeferred}, _lastInterrupt{kIntrNull},
+		_runState{kRunDeferred},
 		_runCount{1},
 		_executor{&_userContext, &Thread::launchCurrent_},
 		intrImage_{&_userContext, abi},
 		_universe{std::move(universe)}, _addressSpace{std::move(address_space)} {
 	_lastRunTimeUpdate = getClockNanos();
+	// TODO: Alternatively, we could add a separate observation for new launched threads.
 	intrState_ = IntrState::inInterrupt;
+	_lastInterrupt = kIntrRequested;
 }
 
 Thread::~Thread() {
