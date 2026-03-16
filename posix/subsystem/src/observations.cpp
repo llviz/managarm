@@ -13,6 +13,32 @@
 
 namespace {
 
+void alertRemoteQueue(Process *self) {
+	HelHandle handle;
+	auto err = helTransferDescriptor(
+	    self->accessThreadPage()->queueHandle,
+	    self->fileContext()->getUniverse().getHandle(),
+	    kHelTransferDescriptorIn,
+	    &handle
+	);
+
+	if (err == kHelErrNone) {
+		if (int alertErr = helAlertQueue(handle); alertErr != kHelErrNone)
+			std::println(
+				"posix: unexpected error {} for helAlertQueue(queueHandle)",
+		    	_helErrorString(alertErr)
+			);
+		HEL_CHECK(helCloseDescriptor(kHelThisUniverse, handle));
+	} else if (err != kHelErrNoDescriptor) {
+		// We ignore kHelErrNoDescriptor because a thread might not (yet) have set up a queue,
+		// but might have received a signal (e.g. via pthread_kill).
+		std::println(
+		    "posix: unexpected error {} for helTransferDescriptor(queueHandle)",
+		    _helErrorString(err)
+		);
+	}
+}
+
 async::result<bool> handlePendingSignalsFromObservation(Process *self) {
 	if constexpr (logSignals)
 		std::println("posix: checking if we should raise pending signals; delayedSignal={}", bool(self->delayedSignal));
@@ -32,15 +58,7 @@ async::result<bool> handlePendingSignalsFromObservation(Process *self) {
 				co_await self->threadGroup()->signalContext()->raiseContext(active, self, handling);
 			} else {
 				self->accessThreadPage()->cancellationRequested = true;
-				HelHandle handle;
-				HEL_CHECK(helTransferDescriptor(
-				    self->accessThreadPage()->queueHandle,
-				    self->fileContext()->getUniverse().getHandle(),
-				    kHelTransferDescriptorIn,
-				    &handle
-				));
-				HEL_CHECK(helAlertQueue(handle));
-				HEL_CHECK(helCloseDescriptor(kHelThisUniverse, handle));
+				alertRemoteQueue(self);
 				if (self->checkOrRequestSignalRaise()) {
 					if constexpr (logSignals)
 						std::println("posix: raising signal");
