@@ -1,9 +1,11 @@
 #include <cassert>
 #include <cstring>
 #include <errno.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/select.h>
 
 #include "testsuite.hpp"
 
@@ -144,3 +146,23 @@ DEFINE_TEST(epoll_edge_triggered, ([] {
 	close(epfd);
 	close(fd);
 }));
+
+DEFINE_TEST(pselect_no_fd_wait, ([] {
+	struct timespec req = {0, 500000000};
+	struct timespec start = {0, 0};
+	struct timespec end = {0, 0};
+
+	int ret = clock_gettime(CLOCK_MONOTONIC, &start);
+	assert(ret == 0);
+
+	ret = pselect(0, NULL, NULL, NULL, &req, NULL);
+	assert(ret == 0);
+
+	ret = clock_gettime(CLOCK_MONOTONIC, &end);
+	assert(ret == 0);
+
+	long elapsed = (end.tv_sec - start.tv_sec) * 1000000000L + (end.tv_nsec - start.tv_nsec);
+	assert(elapsed >= 500000000L);
+
+	return 0;
+}))

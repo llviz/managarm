@@ -799,7 +799,6 @@ async::result<void> serveRequests(std::shared_ptr<Process> self,
 				continue;
 
 			// Second pass: add items to epoll and handle invalid FDs.
-			size_t epollAddedItems = 0;
 			for(auto &[fd, pollEv] : fdsToEvents) {
 				if(fd < 0)
 					continue;
@@ -817,78 +816,75 @@ async::result<void> serveRequests(std::shared_ptr<Process> self,
 				Error ret = epoll::addItem(epfile.get(), self.get(),
 					std::move(locked), fd, pollEv.events, fd);
 				assert(ret == Error::success);
-				epollAddedItems++;
 			}
 
 			struct epoll_event events[16] = {};
 			size_t k = 0;
 			bool interrupted = false;
 
-			if (epollAddedItems) {
-				auto cancelEvent = self->cancelEventRegistry().event(self->credentials(), req.cancellation_id());
-				if (!cancelEvent) {
-					std::println("posix: possibly duplicate cancellation ID registered");
-					sendErrorResponse(managarm::posix::Errors::INTERNAL_ERROR);
-					continue;
-				}
+			auto cancelEvent = self->cancelEventRegistry().event(self->credentials(), req.cancellation_id());
+			if (!cancelEvent) {
+				std::println("posix: possibly duplicate cancellation ID registered");
+				sendErrorResponse(managarm::posix::Errors::INTERNAL_ERROR);
+				continue;
+			}
 
-				if(timeout < 0) {
-					co_await async::race_and_cancel(
-						async::lambda([&](auto c) -> async::result<void> {
-							co_await async::suspend_indefinitely(c, cancelEvent);
-							// if the cancelEvent was raised, we consider this wait to have been
-							// interrupted.
-							if (async::cancellation_token{cancelEvent}.is_cancellation_requested())
-								interrupted = true;
-						}),
-						async::lambda([&](auto c) -> async::result<void> {
-							if (req.has_signal_seq() && self->enteredSignalSeq() != req.signal_seq()) {
-								// a signal was already raised since the request's
-								// signal seqnum
-								interrupted = true;
-								co_return;
-							}
-							co_await async::suspend_indefinitely(c);
-						}),
-						async::lambda([&](auto c) -> async::result<void> {
-							k = co_await epoll::wait(epfile.get(), events, 16, c);
-						})
-					);
-				}else if(!timeout) {
-					// Do not bother to set up a timer for zero timeouts.
-					async::cancellation_event cancel_wait;
-					cancel_wait.cancel();
-					k = co_await epoll::wait(epfile.get(), events, 16, cancel_wait);
-				}else{
-					assert(timeout > 0);
-					co_await async::race_and_cancel(
-						async::lambda([&](auto c) -> async::result<void> {
-							// if the timeout runs to completion, i.e. the sleep does not return
-							// false to signal cancellation, we DO NOT consider the call to have
-							// been interrupted.
-							co_await helix::sleepFor(static_cast<uint64_t>(timeout), c);
-						}),
-						async::lambda([&](auto c) -> async::result<void> {
-							co_await async::suspend_indefinitely(c, cancelEvent);
-							// if the cancelEvent was raised, we consider this wait to have been
-							// interrupted.
-							if (async::cancellation_token{cancelEvent}.is_cancellation_requested())
-								interrupted = true;
-						}),
-						async::lambda([&](auto c) -> async::result<void> {
-							if (req.has_signal_seq() && self->enteredSignalSeq() != req.signal_seq()) {
-								// a signal was already raised since the request's
-								// signal seqnum
-								interrupted = true;
-								co_return;
-							}
-							co_await async::suspend_indefinitely(c);
-						}),
-						async::lambda([&](auto c) -> async::result<void> {
-							k = co_await epoll::wait(epfile.get(), events, 16, c);
-						})
-					);
-				}
+			if(timeout < 0) {
+				co_await async::race_and_cancel(
+					async::lambda([&](auto c) -> async::result<void> {
+						co_await async::suspend_indefinitely(c, cancelEvent);
+						// if the cancelEvent was raised, we consider this wait to have been
+						// interrupted.
+						if (async::cancellation_token{cancelEvent}.is_cancellation_requested())
+							interrupted = true;
+					}),
+					async::lambda([&](auto c) -> async::result<void> {
+						if (req.has_signal_seq() && self->enteredSignalSeq() != req.signal_seq()) {
+							// a signal was already raised since the request's
+							// signal seqnum
+							interrupted = true;
+							co_return;
+						}
+						co_await async::suspend_indefinitely(c);
+					}),
+					async::lambda([&](auto c) -> async::result<void> {
+						k = co_await epoll::wait(epfile.get(), events, 16, c);
+					})
+				);
+			}else if(!timeout) {
+				// Do not bother to set up a timer for zero timeouts.
+				async::cancellation_event cancel_wait;
+				cancel_wait.cancel();
+				k = co_await epoll::wait(epfile.get(), events, 16, cancel_wait);
+			}else{
+				assert(timeout > 0);
+				co_await async::race_and_cancel(
+					async::lambda([&](auto c) -> async::result<void> {
+						// if the timeout runs to completion, i.e. the sleep does not return
+						// false to signal cancellation, we DO NOT consider the call to have
+						// been interrupted.
+						co_await helix::sleepFor(static_cast<uint64_t>(timeout), c);
+					}),
+					async::lambda([&](auto c) -> async::result<void> {
+						co_await async::suspend_indefinitely(c, cancelEvent);
+						// if the cancelEvent was raised, we consider this wait to have been
+						// interrupted.
+						if (async::cancellation_token{cancelEvent}.is_cancellation_requested())
+							interrupted = true;
+					}),
+					async::lambda([&](auto c) -> async::result<void> {
+						if (req.has_signal_seq() && self->enteredSignalSeq() != req.signal_seq()) {
+							// a signal was already raised since the request's
+							// signal seqnum
+							interrupted = true;
+							co_return;
+						}
+						co_await async::suspend_indefinitely(c);
+					}),
+					async::lambda([&](auto c) -> async::result<void> {
+						k = co_await epoll::wait(epfile.get(), events, 16, c);
+					})
+				);
 			}
 
 			// Assigned the returned events to each FD.
