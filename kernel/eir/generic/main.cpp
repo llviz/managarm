@@ -654,18 +654,16 @@ void generateInfo() {
 
 	// Parse the kernel command line.
 	bool serial{false};
-	bool bochs{false};
 	bool kernelProfile{false};
 	frg::array options = {
 	    frg::option{"serial", frg::store_true(serial)},
-	    frg::option{"bochs", frg::store_true(bochs)},
 	    frg::option{"kernel-profile", frg::store_true(kernelProfile)},
 	};
 	parseCmdline(options);
 
 	if (serial)
 		info_ptr->debugFlags |= eirDebugSerial;
-	if (bochs)
+	if (logE9)
 		info_ptr->debugFlags |= eirDebugBochs;
 	if (kernelProfile)
 		info_ptr->debugFlags |= eirDebugKernelProfile;

@@ -810,7 +810,6 @@ extern "C" efi_status eirUefiMain(const efi_handle h, const efi_system_table *sy
 	frg::array args = {
 	    // allow for attaching GDB to eir
 	    frg::option{"eir.efidebug", frg::store_false(eir_gdb_ready_val)},
-	    frg::option{"bochs", frg::store_true(log_e9)},
 	    frg::option{"eir.initrd", frg::as_string_view(initrdPath)},
 	    frg::option{"netserver.gateway", frg::as_string_view(gatewayStr)},
 	    frg::option{"netserver.ip", frg::as_string_view(stationStr)},

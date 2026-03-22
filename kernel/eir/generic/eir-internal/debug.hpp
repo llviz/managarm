@@ -20,7 +20,7 @@ struct PanicSink {
 	void finalize(bool);
 };
 
-extern bool log_e9;
+extern bool logE9;
 
 extern frg::stack_buffer_logger<LogSink, 128> infoLogger;
 extern frg::stack_buffer_logger<PanicSink, 128> panicLogger;

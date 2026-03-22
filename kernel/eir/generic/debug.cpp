@@ -18,7 +18,7 @@ HandlerList &accessHandlerList() {
 
 } // anonymous namespace
 
-bool log_e9 = false;
+bool logE9 = false;
 
 constinit OutputSink infoSink;
 constinit frg::stack_buffer_logger<LogSink, 128> infoLogger;

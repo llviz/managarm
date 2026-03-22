@@ -13,7 +13,7 @@ eirEnterKernel(uintptr_t pml4Pointer, uint64_t entryPtr, uint64_t stackPtr)
 namespace eir {
 
 void debugPrintChar(char c) {
-	if (log_e9) {
+	if (logE9) {
 		static constexpr arch::scalar_register<uint8_t> data{0};
 		auto base = arch::global_io.subspace(0xe9);
 
@@ -21,7 +21,33 @@ void debugPrintChar(char c) {
 	}
 }
 
-void initPlatform() {}
+namespace {
+
+bool detectQemu() {
+	auto features = common::x86::cpuid(common::x86::kCpuIndexFeatures);
+	bool hypervisorPresent = features[2] & (1 << 31);
+	if (!hypervisorPresent)
+		return false;
+
+	auto hvLeaf = common::x86::cpuid(0x40000000);
+	char vendor[12];
+	memcpy(&vendor[0], &hvLeaf[1], 4);
+	memcpy(&vendor[4], &hvLeaf[2], 4);
+	memcpy(&vendor[8], &hvLeaf[3], 4);
+
+	return !memcmp(vendor, "KVMKVMKVM\0\0\0", 12) || !memcmp(vendor, "TCGTCGTCGTCG", 12);
+}
+
+} // anonymous namespace
+
+void initPlatform() {
+	if (detectQemu()) {
+		static constexpr arch::scalar_register<uint8_t> data{0};
+		auto base = arch::global_io.subspace(0xe9);
+		if (base.load(data) == 0xe9)
+			logE9 = true;
+	}
+}
 
 enum X86PageFlags {
 	kPagePresent = 1,

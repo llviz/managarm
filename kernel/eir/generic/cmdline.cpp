@@ -21,6 +21,17 @@ auto &getCmdlineChunks() {
 	return *singleton;
 }
 
+void updateUartsFromCmdline() {
+	bool bochs{false};
+	frg::array options = {
+	    frg::option{"bochs", frg::store_true(bochs)},
+	};
+	parseCmdline(options);
+
+	if (bochs)
+		logE9 = true;
+}
+
 } // namespace
 
 void extendCmdline(frg::string_view chunk) {
@@ -31,6 +42,8 @@ void extendCmdline(frg::string_view chunk) {
 	}
 	assert(cmdlineChunks.size() < maxChunks);
 	cmdlineChunks.push_back(chunk);
+
+	updateUartsFromCmdline();
 }
 
 std::span<frg::string_view> getCmdline() { return getCmdlineChunks(); }
