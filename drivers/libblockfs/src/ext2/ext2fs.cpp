@@ -457,9 +457,49 @@ async::result<std::expected<DirEntry, protocols::fs::Error>> Inode::symlink(std:
 	auto newNode = co_await fs.createSymlink();
 	co_await newNode->readyEvent.wait();
 
-	assert(target.size() <= 60); // TODO: implement this case!
 	newNode->setFileSize(target.size());
-	memcpy(newNode->diskInode()->data.embedded, target.data(), target.size());
+
+	if (target.size() <= 60) {
+		// fast symlink: store target in the inode itself.
+		memcpy(newNode->diskInode()->data.embedded, target.data(), target.size());
+	} else {
+		// slow symlink: store target in data blocks.
+		auto numBlocks = (target.size() + fs.blockSize - 1) / fs.blockSize;
+		co_await fs.assignDataBlocks(newNode.get(), 0, numBlocks);
+
+		auto newSize = (target.size() + 0xFFF) & ~size_t(0xFFF);
+		auto resizeResult = co_await helix_ng::resizeMemory(
+		    helix::BorrowedDescriptor{newNode->backingMemory}, newSize
+		);
+		HEL_CHECK(resizeResult.error());
+
+		newNode->fileMapping = helix::Mapping{
+		    helix::BorrowedDescriptor{newNode->frontalMemory},
+		    0,
+		    newSize,
+		    kHelMapProtRead | kHelMapProtWrite | kHelMapDontRequireBacking
+		};
+
+		helix::LockMemoryView lockMemory;
+		auto &&submit = helix::submitLockMemoryView(
+		    helix::BorrowedDescriptor(newNode->frontalMemory),
+		    &lockMemory,
+		    0,
+		    newSize,
+		    helix::Dispatcher::global()
+		);
+		co_await submit.async_wait();
+		HEL_CHECK(lockMemory.error());
+
+		memcpy(newNode->fileMapping.get(), target.data(), target.size());
+
+		auto syncData = co_await helix_ng::synchronizeSpace(
+		    helix::BorrowedDescriptor{kHelNullHandle},
+		    newNode->fileMapping.get(),
+		    newNode->fileSize()
+		);
+		HEL_CHECK(syncData.error());
+	}
 
 	auto syncInode = co_await helix_ng::synchronizeSpace(
 			helix::BorrowedDescriptor{kHelNullHandle},
