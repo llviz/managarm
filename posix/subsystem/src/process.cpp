@@ -1596,10 +1596,6 @@ async::result<void> Process::terminate(bool *lastInGroup) {
 
 async::result<frg::expected<Error, Process::WaitResult>>
 Process::wait(int pid, WaitFlags flags, async::cancellation_token ct) {
-	if(pid <= 0 && pid != -1) {
-		std::cout << "posix: Unsupported arguments for pid passed to process::wait" << std::endl;
-		co_return Error::illegalArguments;
-	}
 	if(!(flags & waitExited)) {
 		std::cout << "posix: Unsupported arguments for flags passed to process::wait, waitExited must be set" << std::endl;
 		co_return Error::illegalArguments;
@@ -1609,13 +1605,54 @@ Process::wait(int pid, WaitFlags flags, async::cancellation_token ct) {
 		co_return Error::illegalArguments;
 	}
 
-	if((threadGroup()->_children.empty() && threadGroup()->_notifyQueue.empty()) || (pid > 0 && !hasChild(pid)))
+	// Check if a notification queue entry for `tg` matches the requested set.
+	auto notificationMatch = [&](ThreadGroup *tg) -> bool {
+		if (pid > 0) {
+			// match a PID
+			return pid == tg->pid();
+		} else if (pid == 0) {
+			// match any child process in the same process group
+			return pgPointer() == tg->pgPointer();
+		} else if (pid == -1) {
+			// match any child process
+			return true;
+		} else {
+			// match any child process with the PGID of abs(pid)
+			return abs(pid) == tg->pgPointer()->getHull()->getPid();
+		}
+	};
+
+	// Check if there are still children or notifications left that match the requested set.
+	auto hasMatchingChildren = [&]() -> bool {
+		if (pid < -1 || pid == 0) {
+			int pgid = (pid == 0) ? pgPointer()->getHull()->getPid() : abs(pid);
+
+			// check if there are this Process' children left in the process group `pgid`
+			auto matchChildren =
+			    std::ranges::any_of(threadGroup()->_children, [pgid](const auto &c) {
+				    return c->pgPointer() && c->pgPointer()->getHull()->getPid() == pgid;
+			    });
+
+			// check if there are notifications queued for children that are members of
+			// the process group `pgid`
+			auto matchNotifications =
+			    std::ranges::any_of(threadGroup()->_notifyQueue, [pgid](const auto &c) {
+				    return c->pgPointer() && c->pgPointer()->getHull()->getPid() == pgid;
+			    });
+
+			return matchChildren || matchNotifications;
+		} else {
+			return !threadGroup()->_children.empty() || !threadGroup()->_notifyQueue.empty();
+		}
+	};
+
+	if(!hasMatchingChildren() || (pid > 0 && !hasChild(pid)))
 		co_return Error::noChildProcesses;
 
 	std::optional<WaitResult> result{};
 	while(true) {
 		for(auto it = threadGroup()->_notifyQueue.begin(); it != threadGroup()->_notifyQueue.end(); ++it) {
-			if(pid > 0 && pid != (*it)->pid())
+			if(!notificationMatch(*it))
 				continue;
 			if(std::holds_alternative<TerminationByExit>((*it)->_state) && !(flags & (waitExited)))
 				continue;
@@ -1647,7 +1684,7 @@ Process::wait(int pid, WaitFlags flags, async::cancellation_token ct) {
 		if (!co_await threadGroup()->_notifyBell.async_wait(ct))
 			co_return Error::interrupted;
 
-		if (threadGroup()->_children.empty() && threadGroup()->_notifyQueue.empty())
+		if (!hasMatchingChildren())
 			co_return Error::noChildProcesses;
 	}
 }
