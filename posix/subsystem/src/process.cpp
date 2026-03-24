@@ -1653,9 +1653,9 @@ Process::wait(int pid, WaitFlags flags, async::cancellation_token ct) {
 }
 
 bool Process::hasChild(int pid) {
-	return std::ranges::find_if(threadGroup()->_children, [pid](auto e) {
+	return std::ranges::any_of(threadGroup()->_children, [pid](auto e) {
 		return e->pid() == pid;
-	}) != threadGroup()->_children.end();
+	});
 }
 
 async::result<bool> ThreadGroup::awaitNotifyTypeChange(async::cancellation_token token) {
