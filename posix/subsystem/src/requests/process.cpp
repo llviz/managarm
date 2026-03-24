@@ -314,6 +314,10 @@ async::result<void> handleSetPgid(RequestContext& ctx) {
 		}
 	}
 
+	// Wake any waiters (e.g. waitpid); this is necessary as that may need to return ECHLD if we
+	// moved out the last child.
+	target->getParent()->raiseNotifyBell();
+
 	managarm::posix::SvrResponse resp;
 	resp.set_error(managarm::posix::Errors::SUCCESS);
 

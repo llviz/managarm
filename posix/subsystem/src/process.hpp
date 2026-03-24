@@ -941,6 +941,10 @@ struct ThreadGroup : std::enable_shared_from_this<ThreadGroup> {
 	std::unordered_map<int, std::shared_ptr<PosixTimerContext>> timers;
 	id_allocator<int> timerIdAllocator{};
 
+	void raiseNotifyBell() {
+		_notifyBell.raise();
+	}
+
 private:
 	ThreadGroup *parent_;
 	// The leading thread is kept alive until the thread group is terminated, as we need to expose

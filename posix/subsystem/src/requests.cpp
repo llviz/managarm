@@ -739,6 +739,10 @@ async::result<void> serveRequests(std::shared_ptr<Process> self,
 
 			auto session = TerminalSession::initializeNewSession(self->threadGroup());
 
+			// Wake any waiters (e.g. waitpid); this is necessary as that may need to return ECHLD if we
+			// moved out the last child.
+			self->getParent()->raiseNotifyBell();
+
 			resp.set_error(managarm::posix::Errors::SUCCESS);
 			resp.set_sid(session->getSessionId());
 
