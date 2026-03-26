@@ -16,11 +16,13 @@
 
 #include <blockfs.hpp>
 #include "gpt.hpp"
-#include "ext2/ext2fs.hpp"
 #include "raw.hpp"
 #include "trace.hpp"
 #include "fs.bragi.hpp"
 #include <bragi/helpers-std.hpp>
+
+#include "ext2/ext2fs.hpp"
+#include "btrfs/btrfs.hpp"
 
 namespace blockfs {
 
@@ -59,6 +61,8 @@ async::detached servePartition(helix::UniqueLane lane, gpt::Partition *partition
 		managarm::fs::CntRequest req;
 		if (preamble.id() == managarm::fs::CntRequest::message_id) {
 			auto o = bragi::parse_head_only<managarm::fs::CntRequest>(recv_head);
+			recv_head.reset();
+
 			if(!o) {
 				std::cout << "libblockfs: error decoding CntRequest" << std::endl;
 				auto [dismiss] = co_await helix_ng::exchangeMsgs(
@@ -69,13 +73,44 @@ async::detached servePartition(helix::UniqueLane lane, gpt::Partition *partition
 
 			req = *o;
 		}
-		recv_head.reset();
 
-		if(req.req_type() == managarm::fs::CntReqType::DEV_MOUNT) {
+		if(preamble.id() == managarm::fs::MountRequest::message_id) {
+			std::vector<std::byte> tail(preamble.tail_size());
+			auto [recv_tail] = co_await helix_ng::exchangeMsgs(
+					conversation,
+					helix_ng::recvBuffer(tail.data(), tail.size())
+				);
+			HEL_CHECK(recv_tail.error());
+
+			auto req = bragi::parse_head_tail<managarm::fs::MountRequest>(recv_head, tail);
+			recv_head.reset();
+
+			if (!req) {
+				std::cout << "libblockfs: Rejecting request due to decoding failure" << std::endl;
+				break;
+			}
+
 			// Mount the actual file system
-			fs = std::make_unique<ext2fs::FileSystem>(partition);
-			co_await static_cast<ext2fs::FileSystem *>(fs.get())->init();
-			printf("ext2fs is ready!\n");
+			if (req->fs_type() == "ext2") {
+				fs = std::make_unique<ext2fs::FileSystem>(partition);
+				co_await static_cast<ext2fs::FileSystem *>(fs.get())->init();
+				printf("ext2fs is ready!\n");
+			} else if (req->fs_type() == "btrfs") {
+				fs = std::make_unique<btrfs::FileSystem>(partition);
+				co_await static_cast<btrfs::FileSystem *>(fs.get())->init();
+			} else {
+				managarm::fs::SvrResponse resp;
+				resp.set_error(managarm::fs::Errors::NO_BACKING_DEVICE);
+
+				auto ser = resp.SerializeAsString();
+				auto [send_resp, push_node] = co_await helix_ng::exchangeMsgs(
+					conversation,
+					helix_ng::sendBuffer(ser.data(), ser.size()),
+					helix_ng::pushDescriptor({})
+				);
+				HEL_CHECK(send_resp.error());
+				HEL_CHECK(push_node.error());
+			}
 
 			helix::UniqueLane local_lane, remote_lane;
 			std::tie(local_lane, remote_lane) = helix::createStream();
@@ -124,6 +159,7 @@ async::detached servePartition(helix::UniqueLane lane, gpt::Partition *partition
 			HEL_CHECK(recv_tail.error());
 
 			auto req = bragi::parse_head_tail<managarm::fs::RenameRequest>(recv_head, tail);
+			recv_head.reset();
 
 			if (!req) {
 				std::cout << "libblockfs: Rejecting request due to decoding failure" << std::endl;
@@ -228,6 +264,8 @@ async::detached servePartition(helix::UniqueLane lane, gpt::Partition *partition
 			HEL_CHECK(push_node.error());
 		}else if(preamble.id() == managarm::fs::GetFsStatsRequest::message_id) {
 			auto o = bragi::parse_head_only<managarm::fs::GetFsStatsRequest>(recv_head);
+			recv_head.reset();
+
 			if(!o) {
 				std::cout << "libblockfs: error decoding GetFsStatsRequest" << std::endl;
 				auto [dismiss] = co_await helix_ng::exchangeMsgs(
@@ -266,6 +304,7 @@ async::detached servePartition(helix::UniqueLane lane, gpt::Partition *partition
 			HEL_CHECK(send_resp.error());
 		} else if(preamble.id() == managarm::fs::GenericIoctlRequest::message_id) {
 			auto req = bragi::parse_head_only<managarm::fs::GenericIoctlRequest>(recv_head);
+			recv_head.reset();
 
 			if(!req) {
 				std::cout << "libblockfs: Rejecting request due to decoding failure" << std::endl;
@@ -327,6 +366,7 @@ async::detached serveDevice(helix::UniqueLane lane, std::unique_ptr<raw::RawFs> 
 		managarm::fs::CntRequest req;
 		if (preamble.id() == managarm::fs::CntRequest::message_id) {
 			auto o = bragi::parse_head_only<managarm::fs::CntRequest>(recv_head);
+			recv_head.reset();
 			if(!o) {
 				std::cout << "libblockfs: error decoding CntRequest" << std::endl;
 				auto [dismiss] = co_await helix_ng::exchangeMsgs(
@@ -337,9 +377,8 @@ async::detached serveDevice(helix::UniqueLane lane, std::unique_ptr<raw::RawFs> 
 
 			req = *o;
 		}
-		recv_head.reset();
 
-		if(req.req_type() == managarm::fs::CntReqType::DEV_MOUNT) {
+		if(preamble.id() == managarm::fs::MountRequest::message_id) {
 			managarm::fs::SvrResponse resp;
 			resp.set_error(managarm::fs::Errors::ILLEGAL_OPERATION_TARGET);
 
@@ -372,6 +411,7 @@ async::detached serveDevice(helix::UniqueLane lane, std::unique_ptr<raw::RawFs> 
 			HEL_CHECK(push_node.error());
 		} else if(preamble.id() == managarm::fs::GenericIoctlRequest::message_id) {
 			auto req = bragi::parse_head_only<managarm::fs::GenericIoctlRequest>(recv_head);
+			recv_head.reset();
 
 			if(!req) {
 				std::cout << "libblockfs: Rejecting request due to decoding failure" << std::endl;

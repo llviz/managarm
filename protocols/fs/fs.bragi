@@ -71,7 +71,6 @@ enum CntReqType {
 	NONE = 0,
 
 	// Device API.
-	DEV_MOUNT = 11,
 	DEV_OPEN = 14,
 
 	SB_CREATE_REGULAR = 27,
@@ -905,6 +904,17 @@ head(128):
 }
 
 message ChownResponse 50 {
+head(128):
+	Errors error;
+}
+
+message MountRequest 51 {
+head(128):
+tail:
+	string fs_type;
+}
+
+message MountResponse 52 {
 head(128):
 	Errors error;
 }
