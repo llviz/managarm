@@ -2,6 +2,7 @@
 
 #include <async/recurring-event.hpp>
 #include <frg/expected.hpp>
+#include <frg/functional.hpp>
 #include <frg/list.hpp>
 #include <frg/string.hpp>
 #include <thor-internal/error.hpp>
